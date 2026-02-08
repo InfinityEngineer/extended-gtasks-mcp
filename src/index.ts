@@ -1,18 +1,24 @@
 #!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import fs from "fs";
 import { google } from "googleapis";
 import path from "path";
+import { randomUUID } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { TaskActions, TaskResources } from "./Tasks.js";
+
+const SERVER_VERSION = "1.1.0";
+const MCP_PROTOCOL_VERSION = "2025-11-25";
 
 // OAuth2 credentials from environment variables
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -121,16 +127,239 @@ async function initializeAuth(): Promise<boolean> {
   }
 }
 
+// Track active sessions for diagnostics
+let totalConnections = 0;
+let activeSessionCount = 0;
+const startTime = Date.now();
+
+/** The list of all tools this server exposes */
+const TOOL_DEFINITIONS = [
+  {
+    name: "search",
+    description: "Search for a task in Google Tasks",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "list",
+    description: "List all tasks in Google Tasks",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description:
+            "Task list ID or name. If omitted, lists tasks from all lists.",
+        },
+        cursor: {
+          type: "string",
+          description: "Cursor for pagination",
+        },
+        showCompleted: {
+          type: "boolean",
+          description:
+            "Whether to include completed tasks. Default true.",
+        },
+        showHidden: {
+          type: "boolean",
+          description:
+            "Whether to show tasks hidden by 'clear completed'. Default false.",
+        },
+        dueMin: {
+          type: "string",
+          description:
+            "Lower bound for task due date (RFC 3339, e.g. 2026-02-07T00:00:00.000Z). Only returns tasks due on or after this date.",
+        },
+        dueMax: {
+          type: "string",
+          description:
+            "Upper bound for task due date (RFC 3339, e.g. 2026-02-14T00:00:00.000Z). Only returns tasks due before this date.",
+        },
+        updatedMin: {
+          type: "string",
+          description:
+            "Lower bound for last modification time (RFC 3339). Only returns tasks updated after this timestamp.",
+        },
+      },
+    },
+  },
+  {
+    name: "create",
+    description: "Create a new task in Google Tasks",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+        title: {
+          type: "string",
+          description: "Task title",
+        },
+        notes: {
+          type: "string",
+          description: "Task notes",
+        },
+        due: {
+          type: "string",
+          description: "Due date",
+        },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "clear",
+    description:
+      "Clear completed tasks from a Google Tasks task list",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+      },
+      required: ["taskListId"],
+    },
+  },
+  {
+    name: "delete",
+    description: "Delete a task in Google Tasks",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+        id: {
+          type: "string",
+          description: "Task id",
+        },
+      },
+      required: ["id", "taskListId"],
+    },
+  },
+  {
+    name: "update",
+    description: "Update a task in Google Tasks (uses PATCH — only modifies fields you provide)",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+        id: {
+          type: "string",
+          description: "Task ID",
+        },
+        title: {
+          type: "string",
+          description: "Task title",
+        },
+        notes: {
+          type: "string",
+          description: "Task notes",
+        },
+        status: {
+          type: "string",
+          enum: ["needsAction", "completed"],
+          description:
+            "Task status (needsAction or completed)",
+        },
+        due: {
+          type: "string",
+          description: "Due date",
+        },
+      },
+      required: ["id"],
+    },
+  },
+  // Fix 2: list_task_lists
+  {
+    name: "list_task_lists",
+    description:
+      "List all task lists in Google Tasks with their IDs and names",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  // Fix 3: create_task_list
+  {
+    name: "create_task_list",
+    description: "Create a new task list in Google Tasks",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        title: {
+          type: "string",
+          description: "Name for the new task list",
+        },
+      },
+      required: ["title"],
+    },
+  },
+  // Fix 9: filter_by_tag
+  {
+    name: "filter_by_tag",
+    description:
+      "Filter tasks by bracket-tag convention (e.g. [Life], [House], [Tech]) found in task notes/description. Returns all tasks matching the given tag.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        tag: {
+          type: "string",
+          description:
+            "The tag to filter by, without brackets (e.g. 'Life', 'House', 'Tech'). Case-insensitive.",
+        },
+        taskListId: {
+          type: "string",
+          description:
+            "The task list to search. Supports list ID or name.",
+        },
+        includeCompleted: {
+          type: "boolean",
+          description:
+            "Whether to include completed tasks. Default false.",
+        },
+      },
+      required: ["tag"],
+    },
+  },
+  // Diagnostic tool
+  {
+    name: "server_info",
+    description:
+      "Returns diagnostic info about this MCP server: version, uptime, tool count, auth status, active sessions",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+];
+
 /**
  * Creates and configures a new MCP Server instance with all handlers.
- * A fresh server is created per SSE session since SDK 1.0.1's Server
+ * A fresh server is created per session since SDK's Server
  * can only be connected to one transport at a time.
  */
 function createServer(): Server {
   const server = new Server(
     {
       name: "extended-gtasks-mcp",
-      version: "1.0.0",
+      version: SERVER_VERSION,
     },
     {
       capabilities: {
@@ -145,8 +374,6 @@ function createServer(): Server {
     if (!(await initializeAuth())) {
       return {
         resources: [],
-        error:
-          "Authentication required. Please set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN.",
       };
     }
 
@@ -210,220 +437,47 @@ function createServer(): Server {
 
   // Handle listing available tools
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    console.error(`[tools/list] Returning ${TOOL_DEFINITIONS.length} tools`);
     return {
-      tools: [
-        {
-          name: "search",
-          description: "Search for a task in Google Tasks",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              query: {
-                type: "string",
-                description: "Search query",
-              },
-            },
-            required: ["query"],
-          },
-        },
-        {
-          name: "list",
-          description: "List all tasks in Google Tasks",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              taskListId: {
-                type: "string",
-                description:
-                  "Task list ID or name. If omitted, lists tasks from all lists.",
-              },
-              cursor: {
-                type: "string",
-                description: "Cursor for pagination",
-              },
-              showCompleted: {
-                type: "boolean",
-                description:
-                  "Whether to include completed tasks. Default true.",
-              },
-              showHidden: {
-                type: "boolean",
-                description:
-                  "Whether to show tasks hidden by 'clear completed'. Default false.",
-              },
-              dueMin: {
-                type: "string",
-                description:
-                  "Lower bound for task due date (RFC 3339, e.g. 2026-02-07T00:00:00.000Z). Only returns tasks due on or after this date.",
-              },
-              dueMax: {
-                type: "string",
-                description:
-                  "Upper bound for task due date (RFC 3339, e.g. 2026-02-14T00:00:00.000Z). Only returns tasks due before this date.",
-              },
-              updatedMin: {
-                type: "string",
-                description:
-                  "Lower bound for last modification time (RFC 3339). Only returns tasks updated after this timestamp.",
-              },
-            },
-          },
-        },
-        {
-          name: "create",
-          description: "Create a new task in Google Tasks",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              taskListId: {
-                type: "string",
-                description: "Task list ID or name",
-              },
-              title: {
-                type: "string",
-                description: "Task title",
-              },
-              notes: {
-                type: "string",
-                description: "Task notes",
-              },
-              due: {
-                type: "string",
-                description: "Due date",
-              },
-            },
-            required: ["title"],
-          },
-        },
-        {
-          name: "clear",
-          description:
-            "Clear completed tasks from a Google Tasks task list",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              taskListId: {
-                type: "string",
-                description: "Task list ID or name",
-              },
-            },
-            required: ["taskListId"],
-          },
-        },
-        {
-          name: "delete",
-          description: "Delete a task in Google Tasks",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              taskListId: {
-                type: "string",
-                description: "Task list ID or name",
-              },
-              id: {
-                type: "string",
-                description: "Task id",
-              },
-            },
-            required: ["id", "taskListId"],
-          },
-        },
-        {
-          name: "update",
-          description: "Update a task in Google Tasks (uses PATCH — only modifies fields you provide)",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              taskListId: {
-                type: "string",
-                description: "Task list ID or name",
-              },
-              id: {
-                type: "string",
-                description: "Task ID",
-              },
-              title: {
-                type: "string",
-                description: "Task title",
-              },
-              notes: {
-                type: "string",
-                description: "Task notes",
-              },
-              status: {
-                type: "string",
-                enum: ["needsAction", "completed"],
-                description:
-                  "Task status (needsAction or completed)",
-              },
-              due: {
-                type: "string",
-                description: "Due date",
-              },
-            },
-            required: ["id"],
-          },
-        },
-        // Fix 2: list_task_lists
-        {
-          name: "list_task_lists",
-          description:
-            "List all task lists in Google Tasks with their IDs and names",
-          inputSchema: {
-            type: "object" as const,
-            properties: {},
-          },
-        },
-        // Fix 3: create_task_list
-        {
-          name: "create_task_list",
-          description: "Create a new task list in Google Tasks",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              title: {
-                type: "string",
-                description: "Name for the new task list",
-              },
-            },
-            required: ["title"],
-          },
-        },
-        // Fix 9: filter_by_tag
-        {
-          name: "filter_by_tag",
-          description:
-            "Filter tasks by bracket-tag convention (e.g. [Life], [House], [Tech]) found in task notes/description. Returns all tasks matching the given tag.",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              tag: {
-                type: "string",
-                description:
-                  "The tag to filter by, without brackets (e.g. 'Life', 'House', 'Tech'). Case-insensitive.",
-              },
-              taskListId: {
-                type: "string",
-                description:
-                  "The task list to search. Supports list ID or name.",
-              },
-              includeCompleted: {
-                type: "boolean",
-                description:
-                  "Whether to include completed tasks. Default false.",
-              },
-            },
-            required: ["tag"],
-          },
-        },
-      ],
+      tools: TOOL_DEFINITIONS,
     };
   });
 
   // Handle tool call requests
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
-      // Authenticate first
+      const toolName = request.params.name;
+      console.error(`[tools/call] Tool called: ${toolName}`);
+
+      // Diagnostic tool doesn't need auth
+      if (toolName === "server_info") {
+        const uptimeMs = Date.now() - startTime;
+        const uptimeMin = Math.floor(uptimeMs / 60000);
+        const info = {
+          server: "extended-gtasks-mcp",
+          version: SERVER_VERSION,
+          sdkVersion: "1.26.0",
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          transports: ["streamable-http (/mcp)", "sse (/sse + /message)"],
+          toolCount: TOOL_DEFINITIONS.length,
+          tools: TOOL_DEFINITIONS.map((t) => t.name),
+          authenticated: isAuthenticated,
+          uptimeMinutes: uptimeMin,
+          totalConnections,
+          activeSessions: activeSessionCount,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(info, null, 2),
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      // All other tools need auth
       if (!(await initializeAuth())) {
         return {
           content: [
@@ -435,8 +489,6 @@ function createServer(): Server {
           isError: true,
         };
       }
-
-      const toolName = request.params.name;
 
       if (toolName === "search") {
         return await TaskActions.search(request, tasks!);
@@ -526,7 +578,7 @@ async function authenticateAndSaveCredentials() {
   console.log("Credentials saved. You can now run the server.");
 }
 
-// Fix 7: Native SSE transport (no supergateway needed)
+// Fix 7: Native HTTP transports (no supergateway needed)
 async function initializeAndRunServer() {
   // Check if we're in auth mode
   if (process.argv[2] === "auth") {
@@ -537,33 +589,129 @@ async function initializeAndRunServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || "3000");
 
-  // Store active transports
-  const transports: Record<string, SSEServerTransport> = {};
+  // JSON body parsing for StreamableHTTP POST requests
+  app.use(express.json());
 
+  // Store active transports by session ID
+  const sseTransports: Record<string, SSEServerTransport> = {};
+  const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // ============================================================
+  // StreamableHTTP transport (modern, recommended) at /mcp
+  // ============================================================
+  app.all("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    // Try to find existing session
+    if (sessionId && streamableTransports[sessionId]) {
+      const transport = streamableTransports[sessionId];
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    // New session: must be POST with initialize request
+    if (req.method === "POST" && isInitializeRequest(req.body)) {
+      console.error(`[StreamableHTTP] New session initializing`);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          console.error(`[StreamableHTTP] Session created: ${sid}`);
+          streamableTransports[sid] = transport;
+          totalConnections++;
+          activeSessionCount++;
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          console.error(`[StreamableHTTP] Session closed: ${sid}`);
+          delete streamableTransports[sid];
+          activeSessionCount--;
+        }
+      };
+
+      const server = createServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    // If we have a session ID that doesn't exist, it's stale
+    if (sessionId) {
+      res.status(404).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Session not found. It may have expired." },
+        id: null,
+      });
+      return;
+    }
+
+    // No session ID and not an initialize request
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32600, message: "Bad Request: missing session ID or not an initialize request" },
+      id: null,
+    });
+  });
+
+  // ============================================================
+  // SSE transport (legacy, backwards-compatible) at /sse + /message
+  // ============================================================
   app.get("/sse", async (req, res) => {
-    console.error(`New SSE connection from ${req.ip}`);
+    console.error(`[SSE] New connection from ${req.ip}`);
     const transport = new SSEServerTransport("/message", res);
-    transports[transport.sessionId] = transport;
+    sseTransports[transport.sessionId] = transport;
+    totalConnections++;
+    activeSessionCount++;
 
     res.on("close", () => {
-      console.error(`SSE connection closed: ${transport.sessionId}`);
-      delete transports[transport.sessionId];
+      console.error(`[SSE] Connection closed: ${transport.sessionId}`);
+      delete sseTransports[transport.sessionId];
+      activeSessionCount--;
     });
 
     // Each SSE connection gets its own server instance
-    // because SDK 1.0.1's Server can only bind one transport at a time
     const server = createServer();
     await server.connect(transport);
   });
 
   app.post("/message", async (req, res) => {
     const sessionId = req.query.sessionId as string;
-    const transport = transports[sessionId];
+    const transport = sseTransports[sessionId];
     if (transport) {
-      await transport.handlePostMessage(req, res);
+      await transport.handlePostMessage(req, res, req.body);
     } else {
       res.status(404).send("Session not found");
     }
+  });
+
+  // ============================================================
+  // Health / diagnostics endpoint (plain HTTP, no MCP needed)
+  // ============================================================
+  app.get("/health", (_req, res) => {
+    const uptimeMs = Date.now() - startTime;
+    const uptimeMin = Math.floor(uptimeMs / 60000);
+    res.json({
+      status: "ok",
+      server: "extended-gtasks-mcp",
+      version: SERVER_VERSION,
+      sdkVersion: "1.26.0",
+      protocolVersion: MCP_PROTOCOL_VERSION,
+      transports: {
+        streamableHttp: "/mcp",
+        sse: "/sse",
+        sseMessages: "/message",
+      },
+      toolCount: TOOL_DEFINITIONS.length,
+      tools: TOOL_DEFINITIONS.map((t) => t.name),
+      authenticated: isAuthenticated,
+      uptimeMinutes: uptimeMin,
+      totalConnections,
+      activeSessions: activeSessionCount,
+      activeSSE: Object.keys(sseTransports).length,
+      activeStreamable: Object.keys(streamableTransports).length,
+    });
   });
 
   // Pre-warm auth on startup
@@ -573,8 +721,12 @@ async function initializeAndRunServer() {
   });
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.error(`Google Tasks MCP Server listening on port ${PORT}`);
-    console.error(`SSE endpoint: http://0.0.0.0:${PORT}/sse`);
+    console.error(`Google Tasks MCP Server v${SERVER_VERSION} listening on port ${PORT}`);
+    console.error(`  StreamableHTTP endpoint: http://0.0.0.0:${PORT}/mcp`);
+    console.error(`  SSE endpoint:            http://0.0.0.0:${PORT}/sse`);
+    console.error(`  Health check:            http://0.0.0.0:${PORT}/health`);
+    console.error(`  Tools registered:        ${TOOL_DEFINITIONS.length}`);
+    console.error(`  Tools: ${TOOL_DEFINITIONS.map((t) => t.name).join(", ")}`);
   });
 }
 
