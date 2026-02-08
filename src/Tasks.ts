@@ -145,6 +145,7 @@ export class TaskActions {
       dueMin?: string;
       dueMax?: string;
       updatedMin?: string;
+      pageToken?: string;
     } = {}
   ): Promise<tasks_v1.Schema$Task[]> {
     let taskListIds: string[];
@@ -174,6 +175,7 @@ export class TaskActions {
         if (opts.dueMin) listParams.dueMin = opts.dueMin;
         if (opts.dueMax) listParams.dueMax = opts.dueMax;
         if (opts.updatedMin) listParams.updatedMin = opts.updatedMin;
+        if (opts.pageToken) listParams.pageToken = opts.pageToken;
 
         const tasksResponse = await withRetry(() =>
           tasks.tasks.list(listParams)
@@ -337,6 +339,7 @@ export class TaskActions {
         dueMin: args.dueMin,
         dueMax: args.dueMax,
         updatedMin: args.updatedMin,
+        pageToken: args.cursor,
       });
 
       const taskList = formatTaskList(allTasks);
@@ -406,6 +409,9 @@ export class TaskActions {
   static async search(request: any, tasks: TasksAPI) {
     try {
       const userQuery = request.params.arguments?.query;
+      if (!userQuery) {
+        throw new Error("Search query is required");
+      }
       const allTasks = await this._list(tasks);
       const filteredItems = allTasks.filter(
         (task) =>

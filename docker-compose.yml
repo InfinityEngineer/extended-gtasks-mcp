@@ -1,12 +1,8 @@
 version: '3.8'
 services:
   gtasks-mcp:
-    image: node:20-slim
+    build: .
     container_name: gtasks-mcp
-    working_dir: /app
-    volumes:
-      - .:/app
-    command: sh -c "npm install --production && node dist/index.js"
     env_file: .env
     environment:
       - PORT=3000
