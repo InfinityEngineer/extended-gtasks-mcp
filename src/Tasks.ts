@@ -766,6 +766,62 @@ export class TaskActions {
   }
 
   /**
+   * Move a task from one list to another using the native API move method.
+   */
+  static async moveTask(
+    taskId: string,
+    fromListId: string,
+    toListId: string,
+    tasks: TasksAPI
+  ) {
+    try {
+      const { taskListId: resolvedFrom } = await resolveTaskListId(tasks, fromListId);
+      const { taskListId: resolvedTo } = await resolveTaskListId(tasks, toListId);
+
+      if (resolvedFrom === resolvedTo) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task is already in the destination list`,
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      const result = await withRetry(() =>
+        tasks.tasks.move({
+          tasklist: resolvedFrom,
+          task: taskId,
+          destinationTasklist: resolvedTo,
+        })
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Task "${result.data.title}" moved successfully (ID: ${result.data.id})`,
+          },
+        ],
+        isError: false,
+      };
+    } catch (error) {
+      console.error("Error moving task:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error moving task: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
    * Find tasks due within a date range. Accepts days-from-now or explicit RFC 3339 dates.
    */
   static async dueSoon(
