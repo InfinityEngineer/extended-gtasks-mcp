@@ -627,4 +627,261 @@ export class TaskActions {
       };
     }
   }
+
+  /**
+   * Add a bracket-tag to a task's notes without clobbering existing content.
+   */
+  static async addTag(
+    taskId: string,
+    tag: string,
+    tasks: TasksAPI,
+    taskListId?: string
+  ) {
+    try {
+      const { taskListId: resolvedListId } = await resolveTaskListId(
+        tasks,
+        taskListId
+      );
+
+      // Fetch the current task to get existing notes
+      const existing = await withRetry(() =>
+        tasks.tasks.get({ tasklist: resolvedListId, task: taskId })
+      );
+      const currentNotes = existing.data.notes || "";
+      const tagStr = `[${tag}]`;
+
+      // Check if tag already exists (case-insensitive)
+      const tagPattern = new RegExp(`\\[${tag}\\]`, "i");
+      if (tagPattern.test(currentNotes)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Tag ${tagStr} already exists on task "${existing.data.title}"`,
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      // Append tag to notes
+      const newNotes = currentNotes ? `${currentNotes}\n${tagStr}` : tagStr;
+
+      await withRetry(() =>
+        tasks.tasks.patch({
+          tasklist: resolvedListId,
+          task: taskId,
+          requestBody: { id: taskId, notes: newNotes },
+        })
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Tag ${tagStr} added to task "${existing.data.title}"`,
+          },
+        ],
+        isError: false,
+      };
+    } catch (error) {
+      console.error("Error adding tag:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error adding tag: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Remove a bracket-tag from a task's notes.
+   */
+  static async removeTag(
+    taskId: string,
+    tag: string,
+    tasks: TasksAPI,
+    taskListId?: string
+  ) {
+    try {
+      const { taskListId: resolvedListId } = await resolveTaskListId(
+        tasks,
+        taskListId
+      );
+
+      // Fetch the current task to get existing notes
+      const existing = await withRetry(() =>
+        tasks.tasks.get({ tasklist: resolvedListId, task: taskId })
+      );
+      const currentNotes = existing.data.notes || "";
+      const tagPattern = new RegExp(`\\s*\\[${tag}\\]\\s*`, "gi");
+
+      if (!tagPattern.test(currentNotes)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Tag [${tag}] not found on task "${existing.data.title}"`,
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      const newNotes = currentNotes.replace(tagPattern, "\n").replace(/^\n+|\n+$/g, "");
+
+      await withRetry(() =>
+        tasks.tasks.patch({
+          tasklist: resolvedListId,
+          task: taskId,
+          requestBody: { id: taskId, notes: newNotes },
+        })
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Tag [${tag}] removed from task "${existing.data.title}"`,
+          },
+        ],
+        isError: false,
+      };
+    } catch (error) {
+      console.error("Error removing tag:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error removing tag: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Find tasks due within a date range. Accepts days-from-now or explicit RFC 3339 dates.
+   */
+  static async dueSoon(
+    tasks: TasksAPI,
+    opts: {
+      days?: number;
+      dueMin?: string;
+      dueMax?: string;
+      taskListId?: string;
+      showCompleted?: boolean;
+    } = {}
+  ) {
+    try {
+      const now = new Date();
+      let dueMin = opts.dueMin;
+      let dueMax = opts.dueMax;
+
+      if (opts.days !== undefined && !dueMax) {
+        if (!dueMin) {
+          dueMin = now.toISOString();
+        }
+        const end = new Date(now);
+        end.setDate(end.getDate() + opts.days);
+        end.setHours(23, 59, 59, 999);
+        dueMax = end.toISOString();
+      }
+
+      const allTasks = await this._list(tasks, {
+        taskListId: opts.taskListId,
+        showCompleted: opts.showCompleted ?? false,
+        dueMin,
+        dueMax,
+      });
+
+      const summary = allTasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        due: t.due || null,
+        notes: t.notes || null,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                range: { dueMin, dueMax },
+                count: summary.length,
+                tasks: summary,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: false,
+      };
+    } catch (error) {
+      console.error("Error finding due-soon tasks:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error finding due-soon tasks: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Token-efficient task listing: returns only title, status, due, and id.
+   */
+  static async listSummary(
+    tasks: TasksAPI,
+    opts: {
+      taskListId?: string;
+      showCompleted?: boolean;
+    } = {}
+  ) {
+    try {
+      const allTasks = await this._list(tasks, {
+        taskListId: opts.taskListId,
+        showCompleted: opts.showCompleted ?? true,
+      });
+
+      const summary = allTasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        due: t.due || null,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ count: summary.length, tasks: summary }, null, 2),
+          },
+        ],
+        isError: false,
+      };
+    } catch (error) {
+      console.error("Error listing task summary:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error listing task summary: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
 }

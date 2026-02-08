@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { TaskActions, TaskResources } from "./Tasks.js";
 
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.2.0";
 const MCP_PROTOCOL_VERSION = "2025-11-25";
 
 // OAuth2 credentials from environment variables
@@ -338,6 +338,103 @@ const TOOL_DEFINITIONS = [
       required: ["tag"],
     },
   },
+  // Tag management tools
+  {
+    name: "add_tag",
+    description:
+      "Add a bracket-tag (e.g. [Work], [Urgent]) to a task's notes without overwriting existing content",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "string",
+          description: "Task ID",
+        },
+        tag: {
+          type: "string",
+          description: "Tag name without brackets (e.g. 'Work', 'Urgent')",
+        },
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+      },
+      required: ["id", "tag"],
+    },
+  },
+  {
+    name: "remove_tag",
+    description:
+      "Remove a bracket-tag (e.g. [Work]) from a task's notes",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "string",
+          description: "Task ID",
+        },
+        tag: {
+          type: "string",
+          description: "Tag name without brackets (e.g. 'Work', 'Urgent')",
+        },
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name",
+        },
+      },
+      required: ["id", "tag"],
+    },
+  },
+  // Date-range filtering
+  {
+    name: "due_soon",
+    description:
+      "Find tasks due within a time range. Use 'days' for a quick relative window (e.g. 7 = next 7 days) or provide explicit dueMin/dueMax in RFC 3339.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        days: {
+          type: "number",
+          description: "Number of days from now to look ahead (e.g. 1 = today, 7 = this week)",
+        },
+        dueMin: {
+          type: "string",
+          description: "Explicit lower bound (RFC 3339). Overrides 'days' for start.",
+        },
+        dueMax: {
+          type: "string",
+          description: "Explicit upper bound (RFC 3339). Overrides 'days' for end.",
+        },
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name. If omitted, searches all lists.",
+        },
+        showCompleted: {
+          type: "boolean",
+          description: "Include completed tasks. Default false.",
+        },
+      },
+    },
+  },
+  // Token-efficient listing
+  {
+    name: "list_summary",
+    description:
+      "List tasks with minimal detail (title, status, due, id only). Much more token-efficient than 'list' — use this for quick overviews.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskListId: {
+          type: "string",
+          description: "Task list ID or name. If omitted, lists from all lists.",
+        },
+        showCompleted: {
+          type: "boolean",
+          description: "Whether to include completed tasks. Default true.",
+        },
+      },
+    },
+  },
   // Diagnostic tool
   {
     name: "server_info",
@@ -536,6 +633,47 @@ function createServer(): Server {
           args.taskListId as string | undefined,
           (args.includeCompleted as boolean) ?? false
         );
+      }
+      if (toolName === "add_tag") {
+        const args = request.params.arguments || {};
+        const id = args.id as string;
+        const tag = args.tag as string;
+        if (!id || !tag) {
+          return {
+            content: [{ type: "text", text: "Error: id and tag are required" }],
+            isError: true,
+          };
+        }
+        return await TaskActions.addTag(id, tag, tasks!, args.taskListId as string | undefined);
+      }
+      if (toolName === "remove_tag") {
+        const args = request.params.arguments || {};
+        const id = args.id as string;
+        const tag = args.tag as string;
+        if (!id || !tag) {
+          return {
+            content: [{ type: "text", text: "Error: id and tag are required" }],
+            isError: true,
+          };
+        }
+        return await TaskActions.removeTag(id, tag, tasks!, args.taskListId as string | undefined);
+      }
+      if (toolName === "due_soon") {
+        const args = request.params.arguments || {};
+        return await TaskActions.dueSoon(tasks!, {
+          days: args.days as number | undefined,
+          dueMin: args.dueMin as string | undefined,
+          dueMax: args.dueMax as string | undefined,
+          taskListId: args.taskListId as string | undefined,
+          showCompleted: args.showCompleted as boolean | undefined,
+        });
+      }
+      if (toolName === "list_summary") {
+        const args = request.params.arguments || {};
+        return await TaskActions.listSummary(tasks!, {
+          taskListId: args.taskListId as string | undefined,
+          showCompleted: args.showCompleted as boolean | undefined,
+        });
       }
 
       throw new Error(`Tool not found: ${toolName}`);
