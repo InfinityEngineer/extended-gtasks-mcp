@@ -385,6 +385,30 @@ const TOOL_DEFINITIONS = [
       required: ["id", "tag"],
     },
   },
+  // Move task between lists
+  {
+    name: "move_task",
+    description:
+      "Move a task from one list to another in a single operation. Uses the native Google Tasks move API.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "string",
+          description: "Task ID to move",
+        },
+        fromList: {
+          type: "string",
+          description: "Source task list ID or name",
+        },
+        toList: {
+          type: "string",
+          description: "Destination task list ID or name",
+        },
+      },
+      required: ["id", "fromList", "toList"],
+    },
+  },
   // Date-range filtering
   {
     name: "due_soon",
@@ -657,6 +681,19 @@ function createServer(): Server {
           };
         }
         return await TaskActions.removeTag(id, tag, tasks!, args.taskListId as string | undefined);
+      }
+      if (toolName === "move_task") {
+        const args = request.params.arguments || {};
+        const id = args.id as string;
+        const fromList = args.fromList as string;
+        const toList = args.toList as string;
+        if (!id || !fromList || !toList) {
+          return {
+            content: [{ type: "text", text: "Error: id, fromList, and toList are required" }],
+            isError: true,
+          };
+        }
+        return await TaskActions.moveTask(id, fromList, toList, tasks!);
       }
       if (toolName === "due_soon") {
         const args = request.params.arguments || {};

@@ -18,8 +18,9 @@ Extended fork of [`@alvincrave/gtasks-mcp`](https://www.npmjs.com/package/@alvin
 | 10 | **Tag management** | `add_tag` / `remove_tag` tools to modify tags without clobbering notes |
 | 11 | **`list_summary`** | Token-efficient listing (title + status + due + id only) |
 | 12 | **`due_soon`** | Find tasks due within N days or a date range |
-| 13 | **`server_info`** | Diagnostic tool returning version, SDK, protocol, tool list, session count |
-| 14 | **`/health` endpoint** | Plain HTTP health check with full server diagnostics |
+| 13 | **`move_task`** | Move a task between lists in one call using native API |
+| 14 | **`server_info`** | Diagnostic tool returning version, SDK, protocol, tool list, session count |
+| 15 | **`/health` endpoint** | Plain HTTP health check with full server diagnostics |
 
 ## Setup
 
@@ -57,7 +58,7 @@ npm run build
 PORT=3000 node dist/index.js
 ```
 
-## Available Tools (14)
+## Available Tools (15)
 
 | Tool | Description |
 |------|-------------|
@@ -68,6 +69,7 @@ PORT=3000 node dist/index.js
 | `update` | Update a task via PATCH (only modifies provided fields) |
 | `delete` | Delete a task |
 | `clear` | Clear completed tasks from a list |
+| `move_task` | Move a task from one list to another in a single call |
 | `list_task_lists` | List all task lists with IDs and names |
 | `create_task_list` | Create a new task list |
 | `filter_by_tag` | Find tasks by `[Tag]` convention in notes/title |
@@ -78,22 +80,21 @@ PORT=3000 node dist/index.js
 
 ## Claude.ai Custom Instructions
 
-Add this to your Claude.ai project or custom instructions to enable natural, proactive task management:
+Add this to your Claude.ai custom instructions to enable efficient, natural task management:
 
 ```
-You have access to a Google Tasks MCP server. Use it naturally to help manage my tasks.
+You have access to a Google Tasks MCP server. Use it to help me manage tasks when I ask.
 
-TASK LIST RULES:
-- You manage a "Claude" task list for tracking action items from our conversations.
-- When working through a multi-step problem, proactively create tasks on the "Claude" list
-  as you go and mark them completed as steps are resolved.
-- For tasks that need MY action (not yours), ask me at the end of your message:
-  "Want me to add [task description] to your TODO list?" — only add it if I confirm.
-- NEVER create, modify, or delete tasks on my other lists unless I explicitly ask you to.
+RULES:
+- NEVER create, modify, or delete tasks unless I explicitly ask you to.
+- If during conversation you notice something I should track, ask me at the end of your
+  message: "Want me to add [description] to your [list name] list?" — only act if I confirm.
+- When I do ask you to work with tasks, confirm what you did briefly.
 
 EFFICIENCY:
 - Use list_summary instead of list for quick overviews (saves tokens).
 - Use due_soon with days parameter for date-range queries (e.g. days=7 for this week).
+- Use move_task to move tasks between lists in one call.
 - Use add_tag/remove_tag instead of update when only changing tags.
 - Use filter_by_tag to find tasks by category.
 - Keep tag names short and consistent: [Work], [Home], [Urgent], [Blocked], etc.
@@ -119,7 +120,7 @@ Then tell me:
 Keep your answer short — just the raw tool output and the 3 answers above.
 ```
 
-**Expected:** 14 tools, both `list_task_lists` and `server_info` present, server v1.2.0.
+**Expected:** 15 tools, both `list_task_lists` and `server_info` present, server v1.2.0.
 
 ### Maximum Test (full tool verification)
 
@@ -137,54 +138,65 @@ Call `list_task_lists`. Report: how many lists, and their names. (DO NOT modify 
 ## Step 3: Create a test list
 Call `create_task_list` with title "[TEST] MCP Verification". Report: the new list ID.
 
-## Step 4: Create a test task
+## Step 4: Create a second test list
+Call `create_task_list` with title "[TEST] Move Target". Report: the new list ID.
+
+## Step 5: Create a test task
 Call `create` in the "[TEST] MCP Verification" list with:
 - title: "Verify MCP tools"
 - notes: "[TestTag] Created by automated MCP verification"
 - due: "2099-12-31T00:00:00.000Z"
 Report: the new task ID.
 
-## Step 5: List tasks (summary)
+## Step 6: List tasks (summary)
 Call `list_summary` with taskListId "[TEST] MCP Verification". Report: task count and titles.
 
-## Step 6: Update the task
-Call `update` with the task ID from Step 4:
+## Step 7: Update the task
+Call `update` with the task ID from Step 5:
 - title: "Verify MCP tools (updated)"
-- status: "completed"
 Report: confirmation message.
 
-## Step 7: Search
+## Step 8: Search
 Call `search` with query "Verify MCP". Report: how many results and the matching title(s).
 
-## Step 8: Filter by tag
-Call `filter_by_tag` with tag "TestTag" and taskListId "[TEST] MCP Verification"
-and includeCompleted true. Report: match count and task title(s).
+## Step 9: Filter by tag
+Call `filter_by_tag` with tag "TestTag" and taskListId "[TEST] MCP Verification".
+Report: match count and task title(s).
 
-## Step 9: Add a tag
-Call `add_tag` with the task ID from Step 4, tag "Verified",
+## Step 10: Add a tag
+Call `add_tag` with the task ID from Step 5, tag "Verified",
 and taskListId "[TEST] MCP Verification". Report: confirmation.
 
-## Step 10: Remove a tag
-Call `remove_tag` with the task ID from Step 4, tag "TestTag",
+## Step 11: Remove a tag
+Call `remove_tag` with the task ID from Step 5, tag "TestTag",
 and taskListId "[TEST] MCP Verification". Report: confirmation.
 
-## Step 11: Clear completed
-Call `clear` with taskListId "[TEST] MCP Verification". Report: confirmation.
-
-## Step 12: Delete test task
-Call `delete` with the task ID from Step 4 and taskListId "[TEST] MCP Verification".
+## Step 12: Move task
+Call `move_task` with the task ID from Step 5,
+fromList "[TEST] MCP Verification", toList "[TEST] Move Target".
 Report: confirmation.
+
+## Step 13: Due soon
+Call `due_soon` with days 365 and taskListId "[TEST] Move Target".
+Report: count and any tasks found.
+
+## Step 14: Delete test task
+Call `delete` with the task ID from Step 5 and taskListId "[TEST] Move Target".
+Report: confirmation.
+
+## Step 15: Clean up
+Call `clear` with taskListId "[TEST] MCP Verification". Report: confirmation.
 
 ## Summary
 After all steps, print a table:
 | Step | Tool | Result |
 with a pass/fail on each step.
 
-Note: This creates a "[TEST] MCP Verification" task list that can be deleted
-manually afterward from Google Tasks.
+Note: This creates "[TEST] MCP Verification" and "[TEST] Move Target" task lists
+that can be deleted manually afterward from Google Tasks.
 ```
 
-**Expected:** 12/12 steps pass.
+**Expected:** 15/15 steps pass.
 
 ## Security
 
